@@ -51,6 +51,8 @@ summarize_one() {
       key = gcid "|" name
       if (key in seen) next
       seen[key] = 1
+      # jcmd(히스토그램/힙덤프)·System.gc() 가 강제한 Full GC 는 부하 실험의 정지가 아니다. 따로 세고 통계에서 뺀다.
+      if (name ~ /Heap Inspection Initiated|Heap Dump Initiated|System.gc\(\)/) { tool_full++; tool_full_ms += ms; next }
       cnt++; total += ms
       if (ms > max) { max = ms; maxline = rest }
       kind_cnt[name]++; kind_total[name] += ms
@@ -84,6 +86,7 @@ summarize_one() {
       printf("| Full GC | %d |\n", full)
       printf("| Degenerated GC (셰넌도어) | %d |\n", degen)
       printf("| 이주 실패 (G1 Evacuation Failure) | %d |\n", evacfail)
+      if (tool_full > 0) printf("| (제외) jcmd/System.gc 유발 Full GC | %d회, %.1fms — 통계에서 제외됨 |\n", tool_full, tool_full_ms)
       printf("\n종류별\n\n| 정지 종류 | 횟수 | 최대(ms) | 평균(ms) | 총(ms) |\n|---|---|---|---|---|\n")
       for (k in kind_cnt)
         printf("| %s | %d | %.3f | %.3f | %.1f |\n", k, kind_cnt[k], kind_max[k], kind_total[k] / kind_cnt[k], kind_total[k])

@@ -1,7 +1,7 @@
 // k6 부하 스크립트: 목록 70% / 상세 20% / 작성 10%, 가상 사용자 50명, 3분
 //
 //   k6 run load/board.js
-//   k6 run -e VUS=50 -e DURATION=3m -e BASE=http://localhost:8080 load/board.js
+//   k6 run -e VUS=50 -e DURATION=3m -e SLEEP=0 -e BASE=http://localhost:8080 load/board.js
 //   k6 run --summary-export results/g1/default/k6.json load/board.js   # 수치 파일로 저장
 //
 // 결과에서 기록할 것: http_reqs (RPS), http_req_duration p(50) / p(99) / max
@@ -15,6 +15,9 @@ const BASE = __ENV.BASE || 'http://localhost:8080';
 const VUS = Number(__ENV.VUS || 50);
 const DURATION = __ENV.DURATION || '3m';
 const PAGE_SIZE = 20;
+// VU 당 요청 사이 생각 시간(초). 0 이면 닫힌 루프 최대 처리량 — 서버(GC)가 병목이 되어 컬렉터별 RPS 차이가 드러난다.
+// 0.05 로 주면 RPS 가 VUS/0.05 ≈ 1000 에 캡되어 컬렉터가 무엇이든 RPS 가 같아진다(가설 4 검증 불가). 지연 비교용으로만 쓸 것.
+const SLEEP = Number(__ENV.SLEEP ?? 0);
 
 export const options = {
   scenarios: {
@@ -81,8 +84,7 @@ export default function (data) {
     createDuration.add(res.timings.duration);
     if (check(res, { 'create 201': (x) => x.status === 201 })) created.add(1);
   }
-  // 생각 시간 없이 계속 때리면 로컬 노트북에서는 CPU 가 먼저 바닥난다. 짧게 쉰다.
-  sleep(0.05);
+  if (SLEEP > 0) sleep(SLEEP);
 }
 
 export function handleSummary(data) {

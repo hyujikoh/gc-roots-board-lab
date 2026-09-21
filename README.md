@@ -5,10 +5,13 @@ Spring 게시판 서버를 실험 대상으로 삼아 "무엇이 GC 루트가 �
 ## 빠른 시작
 
 ```bash
-# 요구: JDK 21 (Temurin/Corretto — Oracle 빌드엔 셰넌도어 없음), k6, (분석) Eclipse MAT, JDK Mission Control
+# 요구: JDK 21 (Temurin/Corretto/Homebrew openjdk — Oracle 빌드엔 셰넌도어 없음), k6, (분석) Eclipse MAT, JDK Mission Control
+#   brew install openjdk@21 k6      # 셸 기본 java 가 17 이어도 된다. 빌드는 toolchain 이, run.sh 는 아래 순서로 21 을 찾는다:
+#   sdkman → ~/.gradle/jdks → /opt/homebrew/opt/openjdk@21 → /Library/Java. 못 찾으면 JAVA_HOME=... 으로 넘긴다.
 ./gradlew :app:build                 # 빌드 + 테스트
 
 scripts/run.sh g1                    # 터미널 1: 서버 (g1 | shenandoah | zgc | zgc-gen) [default | leak-static | leak-threadlocal | leak-listener]
+CPUS=2 MEM=2g scripts/run-docker.sh g1   #   또는 코어·메모리를 제한한 Docker 컨테이너에서 (권장: 결과가 노트북 코어 수에 좌우되지 않음)
 k6 run load/board.js                 # 터미널 2: 부하 (VU 50, 3분)
 scripts/dump.sh g1 default mid       # 터미널 3: 부하 중 힙 덤프 + 히스토그램 (루트 지도용)
 
@@ -25,6 +28,8 @@ curl -s localhost:8080/leak/stats    # 누수 프로필에서 누수가 자라�
 - `leak-static` 은 키를 게시글 id 가 아닌 조회 순번으로 잡았다. id 키면 맵이 게시글 수로 수렴해 구세대가 자라지 않아 가설 5 를 볼 수 없기 때문.
 - `leak-threadlocal` 은 목록(20건, 트래픽 70%)을 전부 붙잡으면 1GB 힙이 1분 안에 OOM 이라 25회에 1회만 리스트를 붙잡는다.
 - `run.sh` 는 `-XX:+AlwaysPreTouch` 를 켜서 힙 커밋 시점 차이가 컬렉터 비교에 섞이지 않게 했다. `dumponexit=true` 로 JFR 은 서버 종료 시 확정된다.
+- `run-docker.sh` 는 호스트에서 만든 `app.jar` 를 `eclipse-temurin:21` 이미지에 얹어 `--cpus`(기본 2) `--memory`(기본 2g) 로 띄운다. 결과 폴더는 같고, `dump.sh` 는 컨테이너가 떠 있으면 자동으로 `docker exec` 로 덤프한다. 호스트 실행 결과와 섞어 비교하지 말 것.
+- k6 의 `SLEEP`(요청 간 생각 시간) 기본값은 0 이다. 0.05 로 주면 RPS 가 VU/0.05 ≈ 1000 에 캡되어 컬렉터가 무엇이든 RPS 가 같아진다.
 - `summarize-gc.sh` 는 `Pause ...` 이벤트와 별도로 `[safepoint]` 총량/최대도 낸다. ZGC 는 Pause 이벤트(수십 µs)와 safepoint Total(수 ms)이 크게 다를 수 있다.
 
 ---
@@ -100,6 +105,7 @@ gc-roots-board-lab/
 ├── load/board.js             k6 부하 스크립트
 ├── scripts/
 │   ├── run.sh                컬렉터를 인자로 받아 서버 실행
+│   ├── run-docker.sh         같은 것을 --cpus/--memory 제한한 컨테이너에서 (Dockerfile 사용)
 │   ├── dump.sh               힙 덤프 + 클래스 히스토그램 + 스레드 덤프
 │   └── summarize-gc.sh       gc.log 정지 시간 요약
 ├── results/                  컬렉터·시나리오별 로그와 요약 (대용량은 gitignore)

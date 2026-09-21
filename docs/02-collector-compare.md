@@ -7,17 +7,17 @@
 
 | 항목 | 값 |
 |---|---|
-| JDK (`java -version`) | (results/*/*/java-version.txt) |
-| 머신 | (results/*/*/machine.txt) |
+| JDK (`java -version`) | Temurin 21.0.12+8 (eclipse-temurin:21) |
+| 머신 | Docker Desktop(Linux aarch64 VM) `--cpus=2 --memory=2g`, 호스트 Apple M4 10코어/32GB |
 | 힙 | `-Xms1g -Xmx1g` |
-| 부하 | k6, VU 50, 3분, 목록 70 / 상세 20 / 작성 10 |
+| 부하 | k6, VU 50, 3분, SLEEP=0, 목록 70 / 상세 20 / 작성 10 |
 | 더미 데이터 | 1만 건, 본문 1~4KB |
 
 ## 비교표
 
 | 컬렉터 | 프로필 | RPS | p99 응답(ms) | GC 정지 횟수 | 최대 정지(ms) | 평균 정지(ms) | 총 정지(ms) | 비고 |
 |---|---|---|---|---|---|---|---|---|
-| g1 | default | 미실행 | | | | | | |
+| g1 | default | 4062.1 | 88.5 | 979 | 134.1 | 4.8 | 4703.8 | Docker 2코어/2GB. safepoint 총 13196ms. 상세: results/g1/default/summary.md |
 | shenandoah | default | 미실행 | | | | | | |
 | zgc | default | 미실행 | | | | | | |
 | zgc-gen | default | 미실행 | | | | | | |
@@ -40,8 +40,8 @@ ZGC 는 Pause 이벤트 시간(수십 µs)과 safepoint Total(수 ms) 차이가 
 ## 컬렉터별 로그 관찰
 
 ### G1
-- 단계별 정지 분포 (`Pause Young (Normal)` / `(Concurrent Start)` / `(Mixed)` / `Remark` / `Cleanup`):
-- 누수 프로필에서 Mixed GC 정지 변화:
+- 단계별 정지 분포 (`Pause Young (Normal)` / `(Concurrent Start)` / `(Mixed)` / `Remark` / `Cleanup`): default 기준 Normal 254회 평균 5.4ms / Concurrent Start 142회 5.5ms / Remark 145회 6.4ms(최대 72ms) / Cleanup 145회 0.25ms / Prepare Mixed 144회 5.4ms(최대 134ms) / Mixed 143회 5.4ms. 주기 145회, 동시 표시 평균 392ms. 정지의 대부분은 Evacuate Collection Set. 2코어라 같은 크기 GC 가 3ms~80ms 로 분산.
+- 누수 프로필에서 Mixed GC 정지 변화: 미실행
 - `MAX_PAUSE=50 scripts/run.sh g1` 로 재실행 시 CSet 크기·GC 빈도 변화: (미실행)
 
 ### 셰넌도어
