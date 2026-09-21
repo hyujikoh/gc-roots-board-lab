@@ -14,7 +14,7 @@
 #   - "[gc]" 또는 "[gc,phases]" 태그의 info 라인 중 "Pause <이름> ... <숫자>ms" 로 끝나는 것.
 #     G1: Pause Young (Normal|Concurrent Start|Mixed|Prepare Mixed), Pause Remark, Pause Cleanup, Pause Full
 #     셰넌도어: Pause Init Mark, Pause Final Mark, Pause Init Update Refs, Pause Final Update Refs, Pause Final Roots
-#     ZGC: Pause Mark Start, Pause Mark End, Pause Relocate Start (세대 구분 ZGC 는 "Y:"/"O:" 접두)
+#     ZGC: Pause Mark Start, Pause Mark End, Pause Relocate Start (세대 구분 ZGC 는 Major 가 "Y:"/"O:", Minor 가 "y:" 접두)
 #   - 같은 GC(n) 의 같은 Pause 가 [gc] 와 [gc,phases] 양쪽에 찍히면 한 번만 센다.
 
 set -euo pipefail
@@ -34,11 +34,11 @@ summarize_one() {
 
   awk -v collector="$collector" -v profile="$profile" '
     # ---------- Pause 이벤트 ----------
-    /\[info\]\[gc(,phases)?[ ]*\] GC\([0-9]+\) (Y: |O: )?Pause / {
+    /\[info\]\[gc(,phases)?[ ]*\] GC\([0-9]+\) (Y: |O: |y: |o: )?Pause / {
       # GC id
       match($0, /GC\([0-9]+\)/); gcid = substr($0, RSTART, RLENGTH)
       # "Pause ..." 부터 끝까지
-      match($0, /(Y: |O: )?Pause .*$/); rest = substr($0, RSTART, RLENGTH)
+      match($0, /(Y: |O: |y: |o: )?Pause .*$/); rest = substr($0, RSTART, RLENGTH)
       # 마지막 토큰이 <숫자>ms 여야 한다
       n = split(rest, tok, " ")
       last = tok[n]

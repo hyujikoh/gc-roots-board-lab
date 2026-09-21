@@ -1,0 +1,25 @@
+date: 2026-09-21T17:43:54+09:00
+runtime: docker (Docker Desktop VM), image=gc-roots-board-lab:latest
+limits: --cpus=2 --memory=2g  heap=1g
+host: Darwin hyujikohui-MacBookPro.local 25.5.0 Darwin Kernel Version 25.5.0: Mon Apr 27 20:41:26 PDT 2026; root:xnu-12377.121.6~2/RELEASE_ARM64_T8132 arm64
+--- JVM 이 본 컨테이너 리소스 ---
+Operating System Metrics:
+    Provider: cgroupv2
+    Effective CPU Count: 2
+    CPU Period: 100000us
+    CPU Quota: 200000us
+    CPU Shares: -1
+    List of Processors: N/A
+    List of Effective Processors, 10 total: 
+    0 1 2 3 4 5 6 7 8 9 
+    List of Memory Nodes: N/A
+    List of Available Memory Nodes, 1 total: 
+    0 
+    Memory Limit: 2.00G
+    Memory Soft Limit: 0.00K
+    Memory & Swap Limit: 4.00G
+    Maximum Processes Limit: Unlimited
+
+--- GC 스레드 ---
+ConcGCThreads=1
+ParallelGCThreads=2
