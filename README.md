@@ -21,6 +21,45 @@ curl -s localhost:8080/leak/stats    # 누수 프로필에서 누수가 자라�
 
 산출물은 `results/<collector>/<profile>/` 에 쌓인다: `gc.log`, `rec.jfr`, `dump-*.hprof`, `histogram-*.txt`, `threads-*.txt`, `java-version.txt`, `machine.txt`, `jvm-flags.txt`. 대용량(hprof, jfr, gc.log)은 gitignore.
 
+## 진행 현황 (2026-09-21)
+
+실행 환경: Docker `--cpus=2 --memory=2g`, 힙 1g 고정, Temurin 21.0.12, k6 VU 50 × 3분 (SLEEP=0). 상세는 [docs/02-collector-compare.md](docs/02-collector-compare.md) 와 `results/<collector>/<profile>/summary.md`.
+
+| 단계 | 상태 |
+|---|---|
+| 게시판 앱 + 누수 시나리오 3종 + 스크립트 | 완료 |
+| default 프로필 컬렉터 4종 실행·GC 로그 기록 | 완료 (셰넌도어/ZGC 의 k6 RPS·p99 는 미기록) |
+| leak-static 프로필 4종 | 진행 중 |
+| leak-threadlocal / leak-listener | 미실행 |
+| MAT 루트 지도 (docs/01), 누수 경로 비교 (docs/03) | 미실행 — `results/g1/default/dump-mid.hprof` 확보됨 |
+
+### default 프로필 결과 요약
+
+| 컬렉터 | RPS | p99 | GC 정지 횟수 | 최대 정지 | 평균 정지 | 총 정지 | safepoint 총 (도달 대기) | 할당 대기 |
+|---|---|---|---|---|---|---|---|---|
+| g1 | 4062 | 88.5ms | 979 | 134ms | 4.8ms | 4.7s | 13.2s | — |
+| shenandoah | 미기록 | 미기록 | 3380 | 56ms | 0.21ms | 0.7s | 9.4s (8.2s) | **Pacing 988s** |
+| zgc | 미기록 | 미기록 | 2016 | 2.0ms | 0.035ms | 0.07s | 7.9s (7.4s) | **Allocation Stall 24,649회 1,835s, 최대 1.0s** |
+| zgc-gen | 미기록 | 미기록 | 2068 | 0.35ms | 0.012ms | 0.03s | 17.9s (17.1s) | Allocation Stall 12,994회 158s, 최대 160ms |
+
+지금까지 알게 된 것
+- **Pause 만 보면 예상대로**: G1 은 이주(Evacuate Collection Set)에서 수십~백 ms, 셰넌도어·ZGC 는 sub-ms.
+- **그러나 2코어에서 진짜 지연은 Pause 밖에 있다.** (1) 100개 톰캣 스레드를 safepoint 에 세우는 도달 대기가 Pause 의 수십~수백 배. (2) 저지연 컬렉터는 "멈추지 않는" 대신 할당 스레드를 재운다 — 셰넌도어 Pacing 988s, ZGC Allocation Stall 1,835s. 책의 "대가: 할당 속도 한계" 가 그대로 수치로 나옴.
+- **세대 구분 ZGC** 는 Allocation Stall 을 1/11.6 로 줄였다 (매번 힙 전체를 표시하지 않고 Minor 631 / Major 35 로 나눔).
+- `jcmd GC.heap_dump` / `GC.class_histogram` 은 기본으로 Full GC 를 강제한다. 비교 실행에는 덤프를 섞지 말 것 (`dump.sh` 는 `-all=true` 로 바꿈).
+
+가설 판정 (진행 중)
+
+| # | 가설 | 판정 |
+|---|---|---|
+| 1 | 스프링 빈은 GC 루트가 아니다 | 미확인 (MAT) |
+| 2 | 요청 중 DTO·엔티티는 Java Local 에만 매달리고 에덴에서 죽는다 | 정황 있음 — 히스토그램 상위에 Post 없음. 확정은 MAT |
+| 3 | 누수 시 루트 경로가 Java Local → System Class / Thread | 미확인 |
+| 4 | G1 은 이주에서 가장 길게 멈추고 셰넌도어·ZGC 는 1ms 안팎, RPS 는 G1 최고 | 정지 부분 맞음 / RPS 미확인 |
+| 5 | 누수로 구세대가 커지면 G1 Mixed 만 길어진다 | 미확인 (leak-static 진행 중) |
+
+---
+
 ## 구현 메모 (핸드오프 문서와 다른 점)
 
 - 앱: Java 21, Spring Boot 3.5.x, Gradle Kotlin DSL, H2 인메모리. 패키지 `io.github.hyujikoh.gcroots.{post,leak}`.
@@ -152,8 +191,8 @@ ZGC 로그: `Pause Mark Start` / `Concurrent Mark` / `Pause Mark End` / `Concurr
 
 ## 9. 완료 기준
 
-- [x] `./scripts/run.sh g1` 한 줄로 서버가 뜨고, `k6 run load/board.js`로 부하가 걸린다 (코드 작성 완료, 로컬 실행 확인은 아래 "진행 상태")
-- [ ] 네 가지 컬렉터 설정 모두에서 gc.log와 JFR 파일이 생성된다
+- [x] `./scripts/run.sh g1` 한 줄로 서버가 뜨고, `k6 run load/board.js`로 부하가 걸린다
+- [x] 네 가지 컬렉터 설정 모두에서 gc.log와 JFR 파일이 생성된다 (Docker, default 프로필)
 - [ ] `docs/01-gc-roots.md`에 정상 프로필의 루트 지도가 기록돼 있다
 - [ ] `docs/03-leak-scenarios.md`에 시나리오별 "Path to GC Roots"가 예상 경로와 비교돼 있다
 - [ ] `docs/02-collector-compare.md`에 비교 표와 가설 5개 각각의 판정이 적혀 있다
