@@ -1,206 +1,182 @@
 # gc-roots-board-lab
 
-Spring 게시판 서버를 실험 대상으로 삼아 "무엇이 GC 루트가 되는가"와 "G1 / 셰넌도어 / ZGC가 같은 부하에서 어떻게 다르게 멈추는가"를 직접 확인하는 실험 레포.
+Spring 게시판 서버 하나를 놓고 **G1 · Shenandoah · ZGC · Generational ZGC** 가 같은 부하에서 어떻게 다르게 멈추는지, 그리고 **무엇이 GC 루트가 되는지** 를 GC 로그·힙 덤프·JFR 로 직접 확인하는 실험 레포.
+
+> 실행 환경: Docker `--cpus=2 --memory=2g`, 힙 1GB 고정, Temurin 21.0.12, k6 VU 50 × 3분 · 2026-09-21
+
+## 한 줄 결론
+
+**저지연 컬렉터는 "멈추지 않는" 대신 "할당을 재운다".** GC Pause 만 보면 Shenandoah·ZGC 는 G1 의 1/20~1/400 이지만, 2코어 환경에서 3분 부하를 걸자 Shenandoah 는 할당 스레드를 988초 재웠고(Pacing), ZGC 는 Allocation Stall 로 1,835초를 세웠다. "정지 1ms" 와 "응답 지연 1ms" 는 다른 말이다.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/time-budget-dark.svg">
+  <img alt="3분 부하 동안 시간이 어디로 갔나 — GC Pause 합계 / safepoint 도달 대기 / 할당 대기" src="docs/img/time-budget-light.svg">
+</picture>
+
+## 목차
+
+- [핵심 결과](#핵심-결과)
+- [가설과 판정](#가설과-판정)
+- [빠른 시작](#빠른-시작)
+- [실험 설계](#실험-설계)
+- [레포 구조](#레포-구조)
+- [진행 현황과 잔여 작업](#진행-현황과-잔여-작업)
+
+## 핵심 결과
+
+### 1. Pause 만 보면 이론 그대로다
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/pause-dark.svg">
+  <img alt="컬렉터별 평균 GC 정지, default vs leak-static (로그 눈금)" src="docs/img/pause-light.svg">
+</picture>
+
+| 컬렉터 | GC 정지 횟수 | 최대 정지 | 평균 정지 | 총 정지 (3분) | 정지의 정체 |
+|---|---|---|---|---|---|
+| **G1** | 979 | 134 ms | 4.8 ms | 4.7 s | `Evacuate Collection Set` — 살아있는 객체 복사가 정지의 98% |
+| **Shenandoah** | 3,380 | 56 ms | 0.21 ms | 0.7 s | Init/Final Mark, Init/Final Update Refs — 주기당 4개, 각 0.1~0.3 ms |
+| **ZGC** | 2,016 | 2.0 ms | 0.035 ms | 0.07 s | Mark Start / Mark End / Relocate Start — 주기당 3개 |
+| **ZGC-gen** | 2,068 | 0.35 ms | 0.012 ms | 0.03 s | 위와 같음, Minor 631 + Major 35 |
+
+G1 한 주기가 로그에 그대로 보인다: `Pause Young (Concurrent Start)` → `Concurrent Mark Cycle` → `Pause Remark` → `Pause Cleanup` → `Pause Young (Prepare Mixed)` → `Pause Young (Mixed)`. 3분 동안 145번 돌았다.
+
+### 2. 그런데 진짜 지연은 Pause 밖에 있다
+
+| 컬렉터 | GC Pause 합계 | safepoint 도달 대기 | 할당 대기 (스레드·초) | 힙 압박 신호 |
+|---|---|---|---|---|
+| G1 | 4.7 s | 7.5 s | — | 없음 |
+| Shenandoah | 0.7 s | 8.2 s | **Pacing 988 s** | Degenerated 0 |
+| ZGC | 0.07 s | 7.4 s | **Allocation Stall 1,835 s** (24,649회, 최대 1.0 s) | 주기 672회 중 638회가 Stall 트리거 |
+| ZGC-gen | 0.03 s | 17.1 s | Allocation Stall 158 s (최대 160 ms) | Stall 이 ZGC 의 1/11.6 |
+
+- **safepoint 도달 대기**: Pause 자체는 수십 µs 여도, 2코어에서 톰캣 스레드 100개를 세우는 데 그 100배가 든다. Shenandoah `[gc,stats]` 의 Net(0.16 ms) vs Gross(최대 902 ms) 차이가 그것.
+- **할당 대기**: 동시 GC 가 할당 속도를 못 따라가면 Shenandoah 는 Pacer 로 할당 스레드를 재우고, ZGC 는 Allocation Stall 로 세운다. 요청 스레드 입장에선 이게 곧 응답 지연이지만 `Pause` 로그에는 안 찍힌다.
+- **세대 구분 ZGC** 는 매번 힙 전체를 표시하지 않아 Stall 을 1/11.6 로 줄였다. 책의 "JDK 21 세대 구분 ZGC 도입" 이 왜 필요했는지가 여기서 보인다.
+
+### 3. 누수가 생기면 — 가설 5
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/leak-alloc-wait-dark.svg">
+  <img alt="누수(leak-static) 시 컬렉터별 할당 대기 변화" src="docs/img/leak-alloc-wait-light.svg">
+</picture>
+
+`leak-static` 프로필은 상세 조회마다 `Post` 를 `static Map` 에 넣고 지우지 않는다. 구세대가 262 → 635 리전으로 자랐다.
+
+| 컬렉터 | Pause 변화 | Pause 밖 변화 |
+|---|---|---|
+| G1 | Mixed 평균 **5.4 → 8.5 ms** (분 단위 7.5 → 9.0 ms 로 누적 증가) | — |
+| Shenandoah | 0.21 → 0.31 ms (그대로) | **Degenerated GC 5회** (최대 131 ms), Pacing 988 → 1,364 s |
+| ZGC | 0.035 → 0.034 ms (그대로) | Stall 1,835 → **2,422 s**, 평균 74 → 98 ms |
+| ZGC-gen | 0.012 → 0.011 ms (그대로) | Stall 158 → **307 s** (×1.9), 최대 160 → 267 ms |
+
+가설("G1 만 길어진다")은 Pause 기준으로 맞다. 하지만 세 저지연 컬렉터 모두 대가를 다른 곳에서 치렀다.
+
+### 4. 실험하다 배운 것
+
+- `jcmd GC.heap_dump` / `GC.class_histogram` 은 기본으로 **Full GC 를 강제**한다 (`Pause Full (Heap Inspection Initiated GC)` 165 ms). 비교 실행에 덤프를 섞으면 안 된다. `dump.sh` 는 `-all=true` 로 바꿨고 `summarize-gc.sh` 는 이런 정지를 따로 센다.
+- k6 에 `sleep(0.05)` 를 두면 RPS 가 VU/0.05 ≈ 1,000 에 캡되어 컬렉터가 무엇이든 RPS 가 같아진다. 처리량 비교는 닫힌 루프(`SLEEP=0`)여야 한다.
+- 세대 구분 ZGC 의 Minor 주기 로그는 소문자 `y:` 접두를 쓴다. 대문자 `Y:` 만 잡으면 정지 횟수를 1/12 로 잘못 센다.
+- 호스트(M4 10코어)에서 돌리면 GC 스레드가 코어를 넉넉히 받아 차이가 흐려진다. `--cpus=2` 가 컬렉터 간 차이를 드러냈다.
+
+전체 수치와 로그 관찰은 [docs/02-collector-compare.md](docs/02-collector-compare.md), 실행별 기록은 `results/<collector>/<profile>/summary.md`.
+
+## 가설과 판정
+
+| # | 가설 | 판정 | 근거 |
+|---|---|---|---|
+| 1 | 스프링 빈은 GC 루트가 아니다 | 미확인 | MAT 로 `PostService` 경로 추적 필요 |
+| 2 | 요청 중 DTO·엔티티는 Java Local 에만 매달리고 에덴에서 죽는다 | 정황 있음 | 히스토그램 상위 20 에 `Post` 없음. 확정은 MAT |
+| 3 | 누수 시 루트 경로가 Java Local → System Class / Thread 로 바뀐다 | 미확인 | leak-static 덤프 + MAT |
+| 4 | G1 은 이주에서 가장 길게 멈추고 Shenandoah·ZGC 는 1 ms 안팎. RPS 는 G1 최고 | **정지: 맞음** / RPS: 미확인 | 위 표. RPS 는 g1 만 기록(4,062) |
+| 5 | 누수로 구세대가 커지면 G1 Mixed 만 길어진다 | **Pause 기준 맞음**, 단 할당 대기가 는다 | 위 표 |
 
 ## 빠른 시작
 
 ```bash
-# 요구: JDK 21 (Temurin/Corretto/Homebrew openjdk — Oracle 빌드엔 셰넌도어 없음), k6, (분석) Eclipse MAT, JDK Mission Control
-#   brew install openjdk@21 k6      # 셸 기본 java 가 17 이어도 된다. 빌드는 toolchain 이, run.sh 는 아래 순서로 21 을 찾는다:
-#   sdkman → ~/.gradle/jdks → /opt/homebrew/opt/openjdk@21 → /Library/Java. 못 찾으면 JAVA_HOME=... 으로 넘긴다.
-./gradlew :app:build                 # 빌드 + 테스트
+# 요구: JDK 21 (Temurin / Corretto / brew openjdk@21 — Oracle 빌드엔 Shenandoah 없음), k6, Docker Desktop
+#       분석: Eclipse MAT (힙 덤프), JDK Mission Control (JFR)
+./gradlew :app:build                          # 빌드 + 테스트 (셸 java 가 17 이어도 toolchain 이 21 을 찾는다)
 
-scripts/run.sh g1                    # 터미널 1: 서버 (g1 | shenandoah | zgc | zgc-gen) [default | leak-static | leak-threadlocal | leak-listener]
-CPUS=2 MEM=2g scripts/run-docker.sh g1   #   또는 코어·메모리를 제한한 Docker 컨테이너에서 (권장: 결과가 노트북 코어 수에 좌우되지 않음)
-k6 run load/board.js                 # 터미널 2: 부하 (VU 50, 3분)
-scripts/dump.sh g1 default mid       # 터미널 3: 부하 중 힙 덤프 + 히스토그램 (루트 지도용)
+scripts/run-docker.sh g1                      # 터미널 1: 2코어/2GB 컨테이너에서 서버
+k6 run --summary-export results/g1/default/k6.json load/board.js    # 터미널 2: 3분 부하
+#  Ctrl+C 로 서버 종료 (JFR 확정)
 
-scripts/summarize-gc.sh --all        # results/ 아래 gc.log 정지 시간 요약 → docs/02 비교표에 옮김
-curl -s localhost:8080/leak/stats    # 누수 프로필에서 누수가 자라는지 확인
+scripts/summarize-gc.sh --all                 # gc.log → 정지 시간 요약표
+scripts/dump.sh g1 default mid                # 부하 중 힙 덤프 (루트 지도용, 비교 실행에는 섞지 말 것)
 ```
 
-산출물은 `results/<collector>/<profile>/` 에 쌓인다: `gc.log`, `rec.jfr`, `dump-*.hprof`, `histogram-*.txt`, `threads-*.txt`, `java-version.txt`, `machine.txt`, `jvm-flags.txt`. 대용량(hprof, jfr, gc.log)은 gitignore.
+`run-docker.sh <g1|shenandoah|zgc|zgc-gen> [default|leak-static|leak-threadlocal|leak-listener]`. 환경변수 `CPUS`(2) `MEM`(2g) `HEAP`(1g) `MAX_PAUSE`(200) `BOARD_SEED_COUNT`(10000). 호스트에서 직접 띄우려면 `scripts/run.sh` (같은 인자).
 
-## 진행 현황 (2026-09-21)
+## 실험 설계
 
-실행 환경: Docker `--cpus=2 --memory=2g`, 힙 1g 고정, Temurin 21.0.12, k6 VU 50 × 3분 (SLEEP=0). 상세는 [docs/02-collector-compare.md](docs/02-collector-compare.md) 와 `results/<collector>/<profile>/summary.md`.
+**대상 앱** — Spring Boot 3.5 / Java 21 / H2 인메모리. `Post(id, title, content 1~4KB, author, viewCount, createdAt)`. `GET /posts?page=&size=` · `GET /posts/{id}` · `POST /posts`. 기동 시 더미 1만 건.
+
+**부하** — k6, VU 50, 3분, 닫힌 루프. 목록 70% / 상세 20% / 작성 10%. 목록이 CLOB 본문 20건을 매번 로드해 초당 수 GB 를 할당한다 — 저지연 컬렉터의 "할당 속도 한계" 를 시험하는 조건.
+
+**JVM 공통 옵션** — `-Xms1g -Xmx1g -XX:+AlwaysPreTouch -Xlog:gc*,safepoint -XX:StartFlightRecording:path-to-gc-roots=true`
+
+| 인자 | 옵션 |
+|---|---|
+| `g1` | `-XX:+UseG1GC -XX:MaxGCPauseMillis=200` |
+| `shenandoah` | `-XX:+UseShenandoahGC` |
+| `zgc` | `-XX:+UseZGC` (JDK 21: 비세대) |
+| `zgc-gen` | `-XX:+UseZGC -XX:+ZGenerational` |
+
+**누수 시나리오** — 스프링 프로필로 켠다. 정상 프로필엔 `PostAccessListener` 구현체가 없고, 각 프로필이 하나씩 켠다.
+
+| 프로필 | 무엇을 붙잡나 | 예상 루트 경로 |
+|---|---|---|
+| `leak-static` | 상세 조회마다 `static Map<Long, Post>` 에 저장 (키 = 조회 순번, 제거 없음) | System Class → static → Map → Post |
+| `leak-threadlocal` | 필터가 `ThreadLocal<List<RequestContext>>` 에 append, `remove()` 생략 | Thread → threadLocals → Entry → List → Post |
+| `leak-listener` | 상세 조회마다 싱글턴 빈의 리스트에 리스너 등록, 해제 없음 | Thread/System Class → ApplicationContext → 빈 → List → Post |
+
+**측정** — `summarize-gc.sh` 가 `Pause ...` 이벤트(횟수·최대·평균·총)와 별도로 `[safepoint]` 총량, Allocation Stall, Degenerated/Full GC, Evacuation Failure 를 센다. Shenandoah Pacing 은 로그 끝 `[gc,stats]` 에서 읽는다.
+
+**주의** — Docker Desktop 컨테이너는 Linux aarch64 VM 위에서 돈다. `--cpus=2` 는 CFS 쿼터라 JVM 은 `availableProcessors=2` 로 읽고 `ParallelGCThreads=2, ConcGCThreads=1` 로 잡는다. 호스트 실행(`run.sh`) 결과와 섞어 비교하지 않는다.
+
+## 레포 구조
+
+```
+├── app/                          Spring Boot 게시판
+│   └── src/main/java/io/github/hyujikoh/gcroots/
+│       ├── post/                 Post, Repository, Service, Controller, Seeder, PostAccessListener 훅
+│       └── leak/                 StaticMapLeak · ThreadLocalLeakFilter · ListenerRegistryLeak · /leak/stats
+├── load/board.js                 k6 부하 스크립트 (SLEEP, VUS, DURATION 환경변수)
+├── scripts/
+│   ├── run.sh                    호스트에서 서버 실행 (JDK 21 자동 탐색)
+│   ├── run-docker.sh             --cpus/--memory 제한 컨테이너에서 실행
+│   ├── dump.sh                   힙 덤프 + 히스토그램 + 스레드 덤프 (컨테이너면 docker exec)
+│   ├── summarize-gc.sh           gc.log 정지 시간 요약 (G1/Shenandoah/ZGC 공통)
+│   └── charts.py                 docs/img 그래프 재생성
+├── results/<collector>/<profile>/
+│   ├── summary.md                실행 기록 (커밋)
+│   ├── machine.txt, java-version.txt, jvm-flags.txt, histogram-*.txt
+│   └── gc.log, rec.jfr, dump-*.hprof   (gitignore)
+├── docs/
+│   ├── 00-handoff.md             처음 세운 배경·가설·계획
+│   ├── 01-gc-roots.md            힙 덤프로 확인한 루트 지도 (미실행)
+│   ├── 02-collector-compare.md   컬렉터 비교 전체 수치와 로그 관찰
+│   ├── 03-leak-scenarios.md      누수 시나리오별 루트 경로 (미실행)
+│   └── img/                      README 그래프
+├── BACKLOG.md                    잔여 작업과 이력
+└── Dockerfile
+```
+
+## 진행 현황과 잔여 작업
 
 | 단계 | 상태 |
 |---|---|
 | 게시판 앱 + 누수 시나리오 3종 + 스크립트 | 완료 |
-| default 프로필 컬렉터 4종 실행·GC 로그 기록 | 완료 (셰넌도어/ZGC 의 k6 RPS·p99 는 미기록) |
-| leak-static 프로필 4종 | 진행 중 |
+| default 프로필 컬렉터 4종 | 완료 |
+| leak-static 프로필 컬렉터 4종 | 완료 |
+| MAT 루트 지도 (가설 1·2·3) | **미실행** — `results/g1/default/dump-mid.hprof` 확보됨 |
 | leak-threadlocal / leak-listener | 미실행 |
-| MAT 루트 지도 (docs/01), 누수 경로 비교 (docs/03) | 미실행 — `results/g1/default/dump-mid.hprof` 확보됨 |
+| Shenandoah / ZGC 의 k6 RPS·p99 | 미기록 |
 
-### default 프로필 결과 요약
+잔여 작업의 우선순위와 지금까지의 변경 이력은 [BACKLOG.md](BACKLOG.md).
 
-| 컬렉터 | RPS | p99 | GC 정지 횟수 | 최대 정지 | 평균 정지 | 총 정지 | safepoint 총 (도달 대기) | 할당 대기 |
-|---|---|---|---|---|---|---|---|---|
-| g1 | 4062 | 88.5ms | 979 | 134ms | 4.8ms | 4.7s | 13.2s | — |
-| shenandoah | 미기록 | 미기록 | 3380 | 56ms | 0.21ms | 0.7s | 9.4s (8.2s) | **Pacing 988s** |
-| zgc | 미기록 | 미기록 | 2016 | 2.0ms | 0.035ms | 0.07s | 7.9s (7.4s) | **Allocation Stall 24,649회 1,835s, 최대 1.0s** |
-| zgc-gen | 미기록 | 미기록 | 2068 | 0.35ms | 0.012ms | 0.03s | 17.9s (17.1s) | Allocation Stall 12,994회 158s, 최대 160ms |
+## 참고
 
-지금까지 알게 된 것
-- **Pause 만 보면 예상대로**: G1 은 이주(Evacuate Collection Set)에서 수십~백 ms, 셰넌도어·ZGC 는 sub-ms.
-- **그러나 2코어에서 진짜 지연은 Pause 밖에 있다.** (1) 100개 톰캣 스레드를 safepoint 에 세우는 도달 대기가 Pause 의 수십~수백 배. (2) 저지연 컬렉터는 "멈추지 않는" 대신 할당 스레드를 재운다 — 셰넌도어 Pacing 988s, ZGC Allocation Stall 1,835s. 책의 "대가: 할당 속도 한계" 가 그대로 수치로 나옴.
-- **세대 구분 ZGC** 는 Allocation Stall 을 1/11.6 로 줄였다 (매번 힙 전체를 표시하지 않고 Minor 631 / Major 35 로 나눔).
-- `jcmd GC.heap_dump` / `GC.class_histogram` 은 기본으로 Full GC 를 강제한다. 비교 실행에는 덤프를 섞지 말 것 (`dump.sh` 는 `-all=true` 로 바꿈).
-
-가설 판정 (진행 중)
-
-| # | 가설 | 판정 |
-|---|---|---|
-| 1 | 스프링 빈은 GC 루트가 아니다 | 미확인 (MAT) |
-| 2 | 요청 중 DTO·엔티티는 Java Local 에만 매달리고 에덴에서 죽는다 | 정황 있음 — 히스토그램 상위에 Post 없음. 확정은 MAT |
-| 3 | 누수 시 루트 경로가 Java Local → System Class / Thread | 미확인 |
-| 4 | G1 은 이주에서 가장 길게 멈추고 셰넌도어·ZGC 는 1ms 안팎, RPS 는 G1 최고 | 정지 부분 맞음 / RPS 미확인 |
-| 5 | 누수로 구세대가 커지면 G1 Mixed 만 길어진다 | 미확인 (leak-static 진행 중) |
-
----
-
-## 구현 메모 (핸드오프 문서와 다른 점)
-
-- 앱: Java 21, Spring Boot 3.5.x, Gradle Kotlin DSL, H2 인메모리. 패키지 `io.github.hyujikoh.gcroots.{post,leak}`.
-- 누수 훅은 `PostAccessListener` 인터페이스 하나로 통일. 정상 프로필에는 구현체가 없고, `leak-*` 프로필이 구현체 빈 하나씩을 켠다.
-- `leak-static` 은 키를 게시글 id 가 아닌 조회 순번으로 잡았다. id 키면 맵이 게시글 수로 수렴해 구세대가 자라지 않아 가설 5 를 볼 수 없기 때문.
-- `leak-threadlocal` 은 목록(20건, 트래픽 70%)을 전부 붙잡으면 1GB 힙이 1분 안에 OOM 이라 25회에 1회만 리스트를 붙잡는다.
-- `run.sh` 는 `-XX:+AlwaysPreTouch` 를 켜서 힙 커밋 시점 차이가 컬렉터 비교에 섞이지 않게 했다. `dumponexit=true` 로 JFR 은 서버 종료 시 확정된다.
-- `run-docker.sh` 는 호스트에서 만든 `app.jar` 를 `eclipse-temurin:21` 이미지에 얹어 `--cpus`(기본 2) `--memory`(기본 2g) 로 띄운다. 결과 폴더는 같고, `dump.sh` 는 컨테이너가 떠 있으면 자동으로 `docker exec` 로 덤프한다. 호스트 실행 결과와 섞어 비교하지 말 것.
-- k6 의 `SLEEP`(요청 간 생각 시간) 기본값은 0 이다. 0.05 로 주면 RPS 가 VU/0.05 ≈ 1000 에 캡되어 컬렉터가 무엇이든 RPS 가 같아진다.
-- `summarize-gc.sh` 는 `Pause ...` 이벤트와 별도로 `[safepoint]` 총량/최대도 낸다. ZGC 는 Pause 이벤트(수십 µs)와 safepoint Total(수 ms)이 크게 다를 수 있다.
-
----
-
-아래는 원래의 핸드오프 문서다. 전후 사정과 확인할 가설, 실험 방법이 적혀 있다.
-
-## 1. 배경 (전후 사정)
-
-작성자(오현직, GitHub `hyujikoh`)는 JVM GC를 학습하면서 G1, 셰넌도어, ZGC의 철학과 처리 단계를 노트로 정리했다. 정리한 핵심은 다음과 같다.
-
-| | G1 | 셰넌도어 | ZGC |
-|---|---|---|---|
-| 철학 | 정지 시간을 예측·제어하면서 처리량 최대화 | 힙 크기와 무관한 짧은 정지 | 힙 크기와 무관한 짧은 정지 |
-| 객체 이동 | 사용자 스레드 정지 상태에서 병렬 수행 | 사용자 스레드와 동시 | 사용자 스레드와 동시 |
-| 리전 간 참조 추적 | 기억 집합 (힙의 10~20% 사용) | 연결 행렬 (책 기준) | 없음, 매 주기 전체 표시 |
-| 동시 이동 해법 | 해당 없음 | 포워딩 포인터 | 컬러 포인터 + 읽기 장벽 + 자가 치유 |
-| 대가 | 힙이 커지면 정지 증가 | 장벽 비용으로 처리량 하락 | 처리량 하락, 할당 속도 한계 |
-
-세 컬렉터 모두 "최초 표시" 단계에서 GC 루트를 스캔하며, 셰넌도어와 ZGC의 정지 시간은 사실상 루트 수에 비례한다. 그래서 자연스럽게 다음 질문이 나왔다.
-
-> 실제 Spring 게시판 서버에서는 어떤 객체가 GC 루트이고, 어떤 객체가 루트에 매달려 오래 살며, 그것이 컬렉터별 동작에 어떤 차이를 만드는가?
-
-이 레포는 그 질문을 이론이 아니라 GC 로그, 힙 덤프, JFR로 눈으로 확인하기 위한 것이다.
-
-## 2. 확인하려는 가설
-
-1. 스프링 빈은 GC 루트가 아니다. 루트(스레드, 시스템 클래스)에서 도달 가능해서 죽지 않을 뿐이다.
-2. 요청 처리 중의 DTO와 엔티티는 톰캣 워커 스레드 스택의 지역 변수(Java Local 루트)에만 매달려 있고, 요청이 끝나면 에덴에서 바로 죽는다.
-3. 누수가 생기면 같은 `Post` 객체의 "루트까지의 경로"가 Java Local에서 System Class 또는 Thread로 바뀐다.
-4. 같은 부하에서 G1은 객체 이동 단계(선별 회수)에서 가장 길게 멈추고, 셰넌도어와 ZGC는 이동을 동시에 하므로 정지가 1ms 안팎에 머문다. 대신 처리량(RPS)은 G1이 가장 높다.
-5. 구세대에 오래 사는 객체가 늘어날수록(누수 시나리오) G1의 Mixed GC 정지는 길어지지만 셰넌도어와 ZGC의 정지 시간은 거의 변하지 않는다.
-
-## 3. 게시판 서버의 GC 루트 지도 (사전 정리)
-
-진짜 루트
-- 스레드 스택 지역 변수: `http-nio-8080-exec-N` 워커가 컨트롤러 → 서비스 → 리포지토리를 타는 동안 프레임에 든 요청 DTO, `Post` 엔티티, 조회 결과 리스트
-- 살아있는 스레드 객체: 톰캣 워커 풀, HikariCP housekeeper, `@Scheduled` 스레드
-- 시스템 클래스로더가 로드한 클래스와 static 필드
-- JNI 참조, `synchronized`로 잡힌 모니터 객체
-
-루트에 매달려 오래 사는 것 (구세대 단골)
-- `ApplicationContext` → `DefaultListableBeanFactory.singletonObjects` → 모든 싱글턴 빈
-- Hibernate `SessionFactory`, 메타모델, 쿼리 플랜 캐시
-- HikariCP 커넥션 풀, Jackson `ObjectMapper` 직렬화기 캐시
-- 풀 스레드에 매달린 `ThreadLocal` 값 (`RequestContextHolder`, 트랜잭션 동기화 정보 등)
-
-금방 죽는 것 (에덴에서 끝남)
-- 요청/응답 DTO, 페이징 결과, JSON 직렬화 버퍼, 영속성 컨텍스트의 엔티티 스냅숏
-
-## 4. 작업 환경과 제약
-
-- GitHub 계정: `hyujikoh`, 레포 이름: `gc-roots-board-lab`
-- 기본 스택: Java 21, Spring Boot 3.x, Gradle (Kotlin DSL), Spring Web + Spring Data JPA, H2 인메모리 DB
-- JDK 배포판: Eclipse Temurin 21 또는 Amazon Corretto 21. Oracle JDK 빌드에는 셰넌도어가 없다.
-- 부하 도구: k6
-- 분석 도구: Eclipse MAT(힙 덤프), JDK Mission Control(JFR), `jcmd`
-- 이 레포는 회사 업무와 무관한 개인 학습용이다. 회사 코드, 설정, 자격 증명을 가져오지 않는다.
-
-에이전트가 지켜야 할 것
-- 레포 생성, 원격 push, 공개 범위 설정은 실행 전에 작성자에게 확인받는다.
-- 토큰, 비밀번호를 파일이나 명령어에 직접 쓰지 않는다. 인증은 작성자가 `gh auth login`으로 직접 한다.
-- 실험 결과 수치를 지어내지 않는다. 실행하지 못한 실험은 "미실행"으로 남긴다.
-
-## 5. 레포 구조
-
-```
-gc-roots-board-lab/
-├── README.md
-├── app/                      Spring Boot 게시판
-│   └── src/main/java/io/github/hyujikoh/gcroots/
-│       ├── post/             Post 엔티티, 리포지토리, 서비스, 컨트롤러, 시더, PostAccessListener 훅
-│       └── leak/             누수 시나리오 3종 (프로필로 on/off) + /leak/stats
-├── load/board.js             k6 부하 스크립트
-├── scripts/
-│   ├── run.sh                컬렉터를 인자로 받아 서버 실행
-│   ├── run-docker.sh         같은 것을 --cpus/--memory 제한한 컨테이너에서 (Dockerfile 사용)
-│   ├── dump.sh               힙 덤프 + 클래스 히스토그램 + 스레드 덤프
-│   └── summarize-gc.sh       gc.log 정지 시간 요약
-├── results/                  컬렉터·시나리오별 로그와 요약 (대용량은 gitignore)
-└── docs/
-    ├── 01-gc-roots.md        힙 덤프로 확인한 루트 지도
-    ├── 02-collector-compare.md  컬렉터 비교 결과 + 가설 판정
-    └── 03-leak-scenarios.md  누수 시나리오별 루트 경로 변화
-```
-
-## 6. 실행 옵션
-
-`scripts/run.sh <g1|shenandoah|zgc|zgc-gen> [profile]`
-
-공통: `-Xms1g -Xmx1g -XX:+AlwaysPreTouch -Xlog:gc*,safepoint:file=...:time,uptime,level,tags -XX:StartFlightRecording:settings=profile,path-to-gc-roots=true,...`
-
-| 인자 | 옵션 |
-|---|---|
-| `g1` | `-XX:+UseG1GC -XX:MaxGCPauseMillis=200` (`MAX_PAUSE` 환경변수로 변경) |
-| `shenandoah` | `-XX:+UseShenandoahGC` |
-| `zgc` | `-XX:+UseZGC` (JDK 21에서는 비세대 ZGC) |
-| `zgc-gen` | `-XX:+UseZGC -XX:+ZGenerational` |
-
-환경변수: `HEAP` (기본 1g), `MAX_PAUSE` (기본 200), `BOARD_SEED_COUNT` (기본 10000), `JAVA_HOME`.
-
-## 7. 누수 시나리오
-
-| 프로필 | 내용 | 예상 루트 경로 |
-|---|---|---|
-| `leak-static` | 상세 조회 시 `static Map<Long, Post>`에 제한 없이 저장 | System Class → static 필드 → Map → Post |
-| `leak-threadlocal` | 필터에서 `ThreadLocal`에 요청 컨텍스트(게시글 리스트 포함)를 넣고 `remove()` 생략 | Thread → threadLocals → Entry → value |
-| `leak-listener` | 요청마다 싱글턴 빈의 리스트에 리스너 객체 등록, 해제 없음 | Thread/System Class → ApplicationContext → 싱글턴 빈 → List |
-
-## 8. 컬렉터별 확인 방법
-
-공통: 부하 중 `scripts/dump.sh` → MAT 에서 GC Roots 뷰, `Post` 의 Path to GC Roots (exclude weak/soft). JFR `jdk.OldObjectSample` 로 교차 확인. 자세한 절차는 `docs/01-gc-roots.md`.
-
-G1 로그: `Pause Young (Normal)` / `(Concurrent Start)` / `Concurrent Mark Cycle` / `Pause Remark` / `Pause Cleanup` / `Pause Young (Mixed)`. 누수 프로필에서 Mixed 정지가 늘어나는가. `MAX_PAUSE=50` 이면 CSet 크기와 빈도가 어떻게 바뀌는가.
-
-셰넌도어 로그: `Pause Init Mark` / `Concurrent marking` / `Pause Final Mark` / `Concurrent evacuation` / `Pause Init Update Refs` / `Concurrent update references` / `Pause Final Update Refs` / `Concurrent cleanup`. Pause 가 전부 1ms 안팎인가. `Pacing`, `Degenerated GC`, `Full GC` 발생 여부.
-
-ZGC 로그: `Pause Mark Start` / `Concurrent Mark` / `Pause Mark End` / `Concurrent Select Relocation Set` / `Pause Relocate Start` / `Concurrent Relocate`. Pause 세 개가 모두 1ms 미만인가. `Allocation Stall` 발생 여부. `zgc` vs `zgc-gen` 의 주기 횟수와 CPU.
-
-비교 매트릭스: 컬렉터 4종 × 프로필 4종 = 16회. 시간이 부족하면 default + leak-static 만 먼저.
-
-## 9. 완료 기준
-
-- [x] `./scripts/run.sh g1` 한 줄로 서버가 뜨고, `k6 run load/board.js`로 부하가 걸린다
-- [x] 네 가지 컬렉터 설정 모두에서 gc.log와 JFR 파일이 생성된다 (Docker, default 프로필)
-- [ ] `docs/01-gc-roots.md`에 정상 프로필의 루트 지도가 기록돼 있다
-- [ ] `docs/03-leak-scenarios.md`에 시나리오별 "Path to GC Roots"가 예상 경로와 비교돼 있다
-- [ ] `docs/02-collector-compare.md`에 비교 표와 가설 5개 각각의 판정이 적혀 있다
-
-## 10. 참고와 주의
-
-- 이론 부분은 『JVM 밑바닥까지 파헤치기』(JDK 11~17 시점 서술) 기준이다. 이후 변경점
-  - 셰넌도어: 포워딩 포인터를 별도 필드 대신 객체 헤더 마크 워드에 저장하도록 변경, 연결 행렬 제거
-  - ZGC: JDK 21에서 세대 구분 ZGC 도입, JDK 23부터 기본값. 세대 구분 ZGC는 쓰기 장벽과 기억 집합 성격의 구조를 추가로 사용
-- 셰넌도어의 세대 구분 모드는 JDK 21에 없으므로 이 실험 범위에서 제외한다.
-- 힙 1GB는 저지연 컬렉터의 장점이 드러나기엔 작은 편이다. 여유가 되면 `HEAP=4g BOARD_SEED_COUNT=100000` 으로 한 번 더 돌려 G1의 정지 시간 증가를 확인한다.
+- 이론은 『JVM 밑바닥까지 파헤치기』(JDK 11~17 시점) 기준. 이후 변경: Shenandoah 는 포워딩 포인터를 마크 워드에 저장하고 연결 행렬을 제거; ZGC 는 JDK 21 에서 세대 구분 도입, JDK 23 부터 기본값.
+- Shenandoah 의 세대 구분 모드는 JDK 21 에 없어 제외.
+- 개인 학습용 레포. 회사 코드·설정·자격 증명을 포함하지 않는다.
