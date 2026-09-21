@@ -1,0 +1,57 @@
+spring:
+  application:
+    name: gc-roots-board-lab
+  datasource:
+    url: jdbc:h2:mem:board;DB_CLOSE_DELAY=-1;MODE=LEGACY
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+    hikari:
+      maximum-pool-size: 20
+  jpa:
+    hibernate:
+      ddl-auto: create
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 500
+        order_inserts: true
+  h2:
+    console:
+      enabled: false
+
+server:
+  port: 8080
+  tomcat:
+    threads:
+      max: 100
+
+board:
+  seed:
+    count: ${BOARD_SEED_COUNT:10000}   # 기동 시 적재할 더미 게시글 수
+    min-body-bytes: 1024               # 본문 최소 크기 (1KB)
+    max-body-bytes: 4096               # 본문 최대 크기 (4KB)
+
+logging:
+  level:
+    root: INFO
+    org.hibernate.SQL: WARN
+
+---
+# 누수 시나리오 프로필: 각 프로필은 leak 패키지의 빈 하나를 활성화한다.
+# 실행: scripts/run.sh g1 leak-static
+spring:
+  config:
+    activate:
+      on-profile: leak-static
+---
+spring:
+  config:
+    activate:
+      on-profile: leak-threadlocal
+---
+spring:
+  config:
+    activate:
+      on-profile: leak-listener

@@ -1,0 +1,20 @@
+# 빌드
+build/
+.gradle/
+out/
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# 실험 산출물 (대용량). 요약(summary.md, k6.json, machine.txt 등)은 커밋한다.
+*.hprof
+*.jfr
+results/**/gc.log
+results/**/*.log
+
+# 로컬 환경
+.env
